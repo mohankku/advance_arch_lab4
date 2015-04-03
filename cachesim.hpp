@@ -3,6 +3,7 @@
 
 #include <cinttypes>
 #include <stdlib.h>
+#include <string.h>
 
 #define ADDRESS_SIZE 64
 #define MAX_4BIT 16 
@@ -24,7 +25,7 @@ struct cache_stats_t {
     double   storage_overhead_ratio;
 };
 
-typedef union clock {
+typedef struct clock {
 	uint8_t time_lru;
 	uint8_t time_other:4;
 } logclock_t;
@@ -51,11 +52,12 @@ struct cache_t {
 	uint64_t index_size;
 	uint64_t tag_size;
 	uint64_t total_storage;
+	uint64_t total_overhead_bits;
 	uint64_t total_sets;
 	uint64_t tag_length;
 	cache_entry_t **cache;
 	cache_entry_t *victim_cache;
-	signed uint64_t *nrmu_reg;
+	uint64_t *nmru_reg;
 };
 
 void cache_access(char rw, uint64_t address, cache_stats_t* p_stats);
