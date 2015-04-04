@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
 
 #define ADDRESS_SIZE 64
 #define MAX_4BIT 16 

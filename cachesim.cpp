@@ -72,7 +72,7 @@ void setup_cache(uint64_t c, uint64_t b, uint64_t s, uint64_t v, char st, char r
 	if (cache_metadata.replacement_policy == NMRU_FIFO) {
 		cache_metadata.nmru_reg = (uint64_t *) malloc(sizeof(uint64_t) * cache_metadata.total_sets);
 		for (i=0; i<cache_metadata.total_sets; i++) {
-			cache_metadata.nmru_reg[i] = -1;
+			cache_metadata.nmru_reg[i] = 0;
 		}
 	}
 }
@@ -152,7 +152,9 @@ uint64_t nmru_entry_to_update (uint64_t index) {
 				return entry;
 			}
 		}
-		if ((!found) && (cache_metadata.nmru_reg[index] != entry)) {
+
+		if ((!found) && (cache_metadata.nmru_reg[index] != 0) &&
+			(cache_metadata.nmru_reg[index] != (cache_metadata.cache[index]+entry)->tag)) {
 			found = 1;
 			lru_entry = entry;
 		}
@@ -163,16 +165,35 @@ uint64_t nmru_entry_to_update (uint64_t index) {
 uint64_t nmru_push_entry (uint64_t index, uint64_t entry) {
 	uint64_t i;
 
-	for (i = entry; entry<cache_metadata.blocks_per_set-1; i++) {
-			*(cache_metadata.cache[index]+i) = *(cache_metadata.cache[index]+(i+1));
+	if (cache_metadata.block_type == BLOCKING) {
+		if (!((cache_metadata.cache[index]+entry)->valid1)) {
+			return entry;
+		}
+	} else {
+		if ((!(cache_metadata.cache[index]+entry)->valid1) &&
+		    (!(cache_metadata.cache[index]+entry)->valid2)) {
+			return entry;
+		}
+	}
+
+	for (i = entry; i<cache_metadata.blocks_per_set-1; i++) {
+		if (cache_metadata.block_type == BLOCKING) {
 			if ((cache_metadata.cache[index]+(i+1))->valid1) {
+				*(cache_metadata.cache[index]+i) = *(cache_metadata.cache[index]+(i+1));
 				(cache_metadata.cache[index]+(i+1))->valid1 = 0;
-				if (cache_metadata.nmru_reg[index] == i+1) {
-					cache_metadata.nmru_reg[index] = i;
-				}
 			} else {
 			    return i+1;
 			}
+		} else {
+			if (((cache_metadata.cache[index]+(i+1))->valid1) ||
+			    ((cache_metadata.cache[index]+(i+1))->valid2)) {
+				*(cache_metadata.cache[index]+i) = *(cache_metadata.cache[index]+(i+1));
+				(cache_metadata.cache[index]+(i+1))->valid1 = 0;
+				(cache_metadata.cache[index]+(i+1))->valid2 = 0;
+			} else {
+			    return i+1;
+			}
+		}
 	}
 	return i;
 }
@@ -208,24 +229,47 @@ void read_write(char rw, uint64_t address, cache_stats_t* p_stats, uint64_t tag,
 				if (((cache_metadata.cache[index]+i)->tag == tag) &&
 					((cache_metadata.cache[index]+i)->valid1)) {
 					found = 1;
+				} else {
+					if (((cache_metadata.cache[index]+i)->tag == tag) &&
+						((cache_metadata.cache[index]+i)->valid2)) {
+						found_other_half = 1;
+					}
 				}
-			} else if (block_offset >= (cache_metadata.cacheline_size/2)) {
+			} else {
 				if (((cache_metadata.cache[index]+i)->tag == tag) &&
 					((cache_metadata.cache[index]+i)->valid2)) {
 					found = 1;
+				} else {
+					if (((cache_metadata.cache[index]+i)->tag == tag) &&
+						((cache_metadata.cache[index]+i)->valid1)) {
+						found_other_half = 1;
+					}
 				}
 			}
 		}
-		if (found) {
+		if (found || found_other_half) {
 			// data found. update Stats and return.
 			if (cache_metadata.replacement_policy == LRU) {
 				(cache_metadata.cache[index]+i)->clock_data.time_lru = logical_clock;
 			} else {
 				(cache_metadata.cache[index]+i)->clock_data.time_lru = logical_clock;
-				cache_metadata.nmru_reg[index] = i;
+				cache_metadata.nmru_reg[index] = tag;
 			}
 			if (rw == WRITE) {
 				(cache_metadata.cache[index]+i)->dirty = 1;
+			}
+			if (found_other_half) {
+				// Missed main cache and victim cache
+				if (rw == READ) {
+					p_stats->read_misses++;
+					p_stats->read_misses_combined++;
+				} else {
+					p_stats->write_misses++;
+					p_stats->write_misses_combined++;
+				}
+				//load the other half from memory and mark both valid :)
+				(cache_metadata.cache[index]+i)->valid1 = 1;
+				(cache_metadata.cache[index]+i)->valid2 = 1;
 			}
 			return;
 		}
@@ -264,7 +308,7 @@ void read_write(char rw, uint64_t address, cache_stats_t* p_stats, uint64_t tag,
 						found_other_half = 1;
 					}
 				}
-			} else if (block_offset >= (cache_metadata.cacheline_size/2)) {
+			} else {
 				if ((cache_metadata.victim_cache[i].tag == vict_tag) &&
 					(cache_metadata.victim_cache[i].valid2)) {
 					found = 1;
@@ -283,17 +327,20 @@ void read_write(char rw, uint64_t address, cache_stats_t* p_stats, uint64_t tag,
 				entry_to_evict = nmru_push_entry(index, entry_to_evict);
 			}
 			*(cache_metadata.cache[index]+entry_to_evict) = cache_metadata.victim_cache[i];
-			(cache_metadata.cache[index]+entry_to_evict)->tag = tag;
 			cache_metadata.victim_cache[i] = temp;
+			//update appropriate tag size values
+			(cache_metadata.cache[index]+entry_to_evict)->tag = tag;
 			temp_tag = temp.address >> (cache_metadata.block_offset_size);
 			cache_metadata.victim_cache[i].tag = temp_tag;
+			cache_metadata.victim_cache[i].clock_data.time_lru = logical_clock;
 
 			if (cache_metadata.replacement_policy == LRU) {
 				(cache_metadata.cache[index]+entry_to_evict)->clock_data.time_lru = logical_clock;
 			} else {
 				(cache_metadata.cache[index]+entry_to_evict)->clock_data.time_lru = logical_clock;
-				cache_metadata.nmru_reg[index] = entry_to_evict;
+				cache_metadata.nmru_reg[index] = tag;
 			}
+
 			if (found_other_half) {
 				// Missed main cache and victim cache
 				if (rw == READ) {
@@ -343,6 +390,7 @@ void read_write(char rw, uint64_t address, cache_stats_t* p_stats, uint64_t tag,
 		cache_metadata.victim_cache[vict_entry] = temp;
 		temp_tag = temp.address >> (cache_metadata.block_offset_size);
 		cache_metadata.victim_cache[vict_entry].tag = temp_tag;
+		cache_metadata.victim_cache[vict_entry].clock_data.time_lru = logical_clock;
 	}
 
 	// update the cache entry now
@@ -354,8 +402,10 @@ void read_write(char rw, uint64_t address, cache_stats_t* p_stats, uint64_t tag,
 	} else {
 		if (block_offset < (cache_metadata.cacheline_size/2)) {
 			(cache_metadata.cache[index]+entry_to_evict)->valid1 = 1;
+			(cache_metadata.cache[index]+entry_to_evict)->valid2 = 0;
 		} else {
 			(cache_metadata.cache[index]+entry_to_evict)->valid2 = 1;
+			(cache_metadata.cache[index]+entry_to_evict)->valid1 = 0;
 		}
 	}
 
@@ -369,7 +419,7 @@ void read_write(char rw, uint64_t address, cache_stats_t* p_stats, uint64_t tag,
 		(cache_metadata.cache[index]+entry_to_evict)->clock_data.time_lru = logical_clock;
 	} else {
 		(cache_metadata.cache[index]+entry_to_evict)->clock_data.time_lru = logical_clock;
-		cache_metadata.nmru_reg[index] = entry_to_evict;
+		cache_metadata.nmru_reg[index] = tag;
 	}
 }
 
@@ -412,19 +462,19 @@ void complete_cache(cache_stats_t *p_stats) {
 	p_stats->misses = p_stats->read_misses_combined + p_stats->write_misses_combined;
 
 	p_stats->miss_rate = (double) p_stats->misses/p_stats->accesses;
-	p_stats->hit_time = cache_metadata.blocks_per_set * (0.2);
+	p_stats->hit_time = ceil(cache_metadata.blocks_per_set * (0.2));
 
 	if (cache_metadata.block_type == BLOCKING) {
-		p_stats->miss_penalty = (cache_metadata.blocks_per_set * (0.2)) + 50 +
-							((0.25) * cache_metadata.cacheline_size);
+		p_stats->miss_penalty = ceil((cache_metadata.blocks_per_set * (0.2)) + 50 +
+							((0.25) * cache_metadata.cacheline_size));
 	} else {
-		p_stats->miss_penalty = (cache_metadata.blocks_per_set * (0.2)) + 50 +
-							((0.25) * (cache_metadata.cacheline_size/2));
+		p_stats->miss_penalty = ceil((cache_metadata.blocks_per_set * (0.2)) + 50 +
+							((0.25) * (cache_metadata.cacheline_size/2)));
 	}
 	p_stats->avg_access_time = (double) (p_stats->hit_time + (p_stats->miss_rate * p_stats->miss_penalty));
 
 	p_stats->storage_overhead = cache_metadata.total_overhead_bits;
-	p_stats->storage_overhead_ratio = (double) (cache_metadata.total_overhead_bits / 8);
+	p_stats->storage_overhead_ratio = (double) ((double) cache_metadata.total_overhead_bits / 8);
 	p_stats->storage_overhead_ratio = (double) (p_stats->storage_overhead_ratio /
 		                                        cache_metadata.total_storage);
 
