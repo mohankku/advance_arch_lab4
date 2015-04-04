@@ -69,7 +69,7 @@ void setup_cache(uint64_t c, uint64_t b, uint64_t s, uint64_t v, char st, char r
 				                           cache_metadata.victim_blocks));
 	memset(cache_metadata.victim_cache, 0, (sizeof(cache_entry_t) * cache_metadata.victim_blocks));
 
-	if (cache_metadata.block_type == NMRU_FIFO) {
+	if (cache_metadata.replacement_policy == NMRU_FIFO) {
 		cache_metadata.nmru_reg = (uint64_t *) malloc(sizeof(uint64_t) * cache_metadata.total_sets);
 		for (i=0; i<cache_metadata.total_sets; i++) {
 			cache_metadata.nmru_reg[i] = -1;
@@ -92,9 +92,14 @@ uint64_t victim_to_update () {
 				return entry;
 			}
 		}
-		if (lru > cache_metadata.victim_cache[entry].clock_data.time_lru) {
+		if (lru == 0) {
 			lru = cache_metadata.victim_cache[entry].clock_data.time_lru;
 			lru_entry = entry;
+		} else {
+			if (lru > cache_metadata.victim_cache[entry].clock_data.time_lru) {
+				lru = cache_metadata.victim_cache[entry].clock_data.time_lru;
+				lru_entry = entry;
+			}
 		}
 	}
 	return lru_entry;
@@ -116,9 +121,15 @@ uint64_t lru_entry_to_update (uint64_t index) {
 				return entry;
 			}
 		}
-		if (lru > (cache_metadata.cache[index]+entry)->clock_data.time_lru) {
+
+		if (lru == 0) {
 			lru = (cache_metadata.cache[index]+entry)->clock_data.time_lru;
 			lru_entry = entry;
+		} else {
+			if (lru > (cache_metadata.cache[index]+entry)->clock_data.time_lru) {
+				lru = (cache_metadata.cache[index]+entry)->clock_data.time_lru;
+				lru_entry = entry;
+			}
 		}
 	}
 	return lru_entry;
@@ -172,6 +183,7 @@ void read_write(char rw, uint64_t address, cache_stats_t* p_stats, uint64_t tag,
 	cache_entry_t temp;
 	uint64_t vict_tag = address >> (cache_metadata.block_offset_size);
 	uint8_t found = 0, found_other_half = 0;
+	uint8_t invalid_entry = 0;
 
 	++logical_clock;
 
@@ -209,6 +221,7 @@ void read_write(char rw, uint64_t address, cache_stats_t* p_stats, uint64_t tag,
 			if (cache_metadata.replacement_policy == LRU) {
 				(cache_metadata.cache[index]+i)->clock_data.time_lru = logical_clock;
 			} else {
+				(cache_metadata.cache[index]+i)->clock_data.time_lru = logical_clock;
 				cache_metadata.nmru_reg[index] = i;
 			}
 			if (rw == WRITE) {
@@ -256,7 +269,7 @@ void read_write(char rw, uint64_t address, cache_stats_t* p_stats, uint64_t tag,
 					(cache_metadata.victim_cache[i].valid2)) {
 					found = 1;
 				} else {
-					if ((cache_metadata.victim_cache[i].tag == tag) &&
+					if ((cache_metadata.victim_cache[i].tag == vict_tag) &&
 						(cache_metadata.victim_cache[i].valid1)) {
 						found_other_half = 1;
 					}
@@ -306,18 +319,31 @@ void read_write(char rw, uint64_t address, cache_stats_t* p_stats, uint64_t tag,
 		p_stats->write_misses_combined++;
 	}
 
-	// not in victim cache too. Move entry to victim cache first.
-	vict_entry = victim_to_update();
-	temp = *(cache_metadata.cache[index]+entry_to_evict);
-
-	if (cache_metadata.replacement_policy != LRU) {
-		entry_to_evict = nmru_push_entry(index, entry_to_evict);
+	if (cache_metadata.block_type == BLOCKING) {
+		if (!((cache_metadata.cache[index]+entry_to_evict)->valid1)) {
+			invalid_entry = 1;
+		}
+	} else {
+		if ((!((cache_metadata.cache[index]+entry_to_evict)->valid1)) &&
+		    (!((cache_metadata.cache[index]+entry_to_evict)->valid2))) {
+			invalid_entry = 1;
+		}
 	}
 
-	// evict victim, need to write to memory if dirty
-	cache_metadata.victim_cache[vict_entry] = temp;
-	temp_tag = temp.address >> (cache_metadata.block_offset_size);
-	cache_metadata.victim_cache[i].tag = temp_tag;
+	if (!invalid_entry) {
+		// not in victim cache too. Move entry to victim cache first.
+		vict_entry = victim_to_update();
+		temp = *(cache_metadata.cache[index]+entry_to_evict);
+
+		if (cache_metadata.replacement_policy != LRU) {
+			entry_to_evict = nmru_push_entry(index, entry_to_evict);
+		}
+
+		// evict victim, need to write to memory if dirty
+		cache_metadata.victim_cache[vict_entry] = temp;
+		temp_tag = temp.address >> (cache_metadata.block_offset_size);
+		cache_metadata.victim_cache[vict_entry].tag = temp_tag;
+	}
 
 	// update the cache entry now
 	(cache_metadata.cache[index]+entry_to_evict)->address = address;
@@ -357,19 +383,19 @@ void read_write(char rw, uint64_t address, cache_stats_t* p_stats, uint64_t tag,
  */
 void cache_access(char rw, uint64_t address, cache_stats_t* p_stats) {
 	uint64_t block_offset;
-	uint64_t index;
-	uint64_t tag, tag_size;
+	uint64_t index, tag;
 
 	tag = address >> (cache_metadata.block_offset_size + cache_metadata.index_size);
-	tag_size = ADDRESS_SIZE - (cache_metadata.block_offset_size + cache_metadata.index_size);
 
-	index = ((1 << (cache_metadata.index_size + cache_metadata.block_offset_size + 1)) - 1);
-	index = index << tag_size;
+	index = ((1 << (cache_metadata.index_size + cache_metadata.block_offset_size)) - 1);
+	//index = index << tag_size;
 	index = address & index;
-	index = index >> (cache_metadata.block_offset_size + tag_size);
+	index = index >> (cache_metadata.block_offset_size);
 
-	block_offset = ((1 << (cache_metadata.block_offset_size + 1)) - 1);
+	block_offset = ((1 << (cache_metadata.block_offset_size)) - 1);
 	block_offset = address & block_offset;
+
+	//printf("%lu, %lu, %lu\n", tag, index, block_offset);
 
 	// retrieve block Offset, Index and Tag from the address
 	read_write(rw, address, p_stats, tag, index, block_offset);
@@ -385,10 +411,21 @@ void cache_access(char rw, uint64_t address, cache_stats_t* p_stats) {
 void complete_cache(cache_stats_t *p_stats) {
 	p_stats->misses = p_stats->read_misses_combined + p_stats->write_misses_combined;
 
-	p_stats->miss_rate = p_stats->misses/p_stats->accesses;
+	p_stats->miss_rate = (double) p_stats->misses/p_stats->accesses;
+	p_stats->hit_time = cache_metadata.blocks_per_set * (0.2);
+
+	if (cache_metadata.block_type == BLOCKING) {
+		p_stats->miss_penalty = (cache_metadata.blocks_per_set * (0.2)) + 50 +
+							((0.25) * cache_metadata.cacheline_size);
+	} else {
+		p_stats->miss_penalty = (cache_metadata.blocks_per_set * (0.2)) + 50 +
+							((0.25) * (cache_metadata.cacheline_size/2));
+	}
+	p_stats->avg_access_time = (double) (p_stats->hit_time + (p_stats->miss_rate * p_stats->miss_penalty));
 
 	p_stats->storage_overhead = cache_metadata.total_overhead_bits;
-	p_stats->storage_overhead_ratio = (cache_metadata.total_overhead_bits/8) /
-		                               cache_metadata.total_storage;
+	p_stats->storage_overhead_ratio = (double) (cache_metadata.total_overhead_bits / 8);
+	p_stats->storage_overhead_ratio = (double) (p_stats->storage_overhead_ratio /
+		                                        cache_metadata.total_storage);
 
 }

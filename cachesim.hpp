@@ -3,6 +3,7 @@
 
 #include <cinttypes>
 #include <stdlib.h>
+#include <stdio.h>
 #include <string.h>
 
 #define ADDRESS_SIZE 64
@@ -26,7 +27,7 @@ struct cache_stats_t {
 };
 
 typedef struct clock {
-	uint8_t time_lru;
+	uint64_t time_lru;
 	uint8_t time_other:4;
 } logclock_t;
 
